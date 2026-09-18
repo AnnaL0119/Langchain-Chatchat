@@ -2,6 +2,7 @@ import base64
 import hashlib
 import io
 import os
+import re
 import uuid
 from datetime import datetime
 from PIL import Image as PILImage
@@ -21,6 +22,8 @@ from langchain_chatchat.callbacks.agent_callback_handler import AgentStatus
 from chatchat.server.knowledge_base.model.kb_document_model import DocumentWithVSId
 from chatchat.server.knowledge_base.utils import format_reference
 from chatchat.server.utils import MsgType, get_config_models, get_config_platforms, get_default_llm
+from chatchat.webui_pages.ollama_panel import ollama_model_panel
+from chatchat.webui_pages.upload_utils import validate_uploaded_files
 from chatchat.webui_pages.utils import *
 
 
@@ -77,11 +80,12 @@ def get_messages_history(
     return messages
 
 
-@st.cache_data
 def upload_temp_docs(files, _api: ApiRequest) -> str:
     """
     将文件上传到临时目录，用于文件对话
     返回临时向量库ID
+    【阶段3调整】去除 @st.cache_data 缓存：上传失败时返回值 None 会被缓存，
+    导致后端恢复后仍提示失败；该函数仅在"开始上传"按钮点击时调用，无需缓存
     """
     return _api.upload_temp_docs(files).get("data", {}).get("id")
 
@@ -141,6 +145,138 @@ def clear_conv(name: str = None):
     chat_box.reset_history(name=name or None)
 
 
+# 【阶段3新增】批量删除会话弹窗
+# 复用项目原有会话机制（streamlit_chatbox 的会话存储），纯前端实现，不新增后端接口
+@st.experimental_dialog("批量删除会话")
+def batch_del_convs():
+    conv_names = chat_box.get_chat_names()
+
+    # 仅剩一个会话时无需批量删除（与单个删除逻辑一致：至少保留一个会话）
+    if len(conv_names) <= 1:
+        st.warning("当前仅有一个会话，无需批量删除。")
+        if st.button("关闭", use_container_width=True):
+            st.rerun()
+        return
+
+    # 多选待删除的会话；当前会话在选项文字中标注提醒
+    selected = st.multiselect(
+        "请选择要删除的会话：",
+        conv_names,
+        format_func=lambda n: f"{n}（当前会话）" if n == chat_box.cur_chat_name else n,
+    )
+
+    cols = st.columns(2)
+    if cols[0].button(
+        "确认删除",
+        type="primary",
+        use_container_width=True,
+        disabled=len(selected) == 0,  # 未选择任何会话时禁用按钮
+    ):
+        # 校验：不允许一次删除全部会话，至少保留一个
+        if len(selected) >= len(conv_names):
+            st.error("不能删除全部会话，请至少保留一个会话。")
+        else:
+            cur_name = chat_box.cur_chat_name
+            for n in selected:
+                chat_box.del_chat_name(n)
+            # 若当前会话未被删除，则保持停留在原会话；否则 chat_box 已自动切换到剩余第一个会话
+            if cur_name in chat_box.get_chat_names():
+                chat_box.use_chat_name(cur_name)
+            # 同步会话切换标记，避免页面顶部逻辑把状态保存回已删除的会话
+            st.session_state["cur_conv_name"] = chat_box.cur_chat_name
+            st.session_state["last_conv_name"] = chat_box.cur_chat_name
+            restore_session(chat_box.cur_chat_name)
+            st.toast(f"已删除 {len(selected)} 个会话", icon="🗑️")
+            rerun()
+    if cols[1].button("取消", use_container_width=True):
+        st.rerun()
+
+
+# 【阶段3新增】导出内容过滤：对话过程中的临时占位语，不应写入导出文件
+_EXPORT_PLACEHOLDERS = {"正在思考...", "...", ""}
+
+
+def _fmt_export_elements(elements: List) -> str:
+    """
+    【阶段3新增】把一条消息中的展示元素整理为导出文本（仅前端读取会话数据）
+
+    - 普通文本/Markdown 元素：直接拼接；
+    - 折叠面板元素（工具调用、参考资料等）：以 <details> 折叠块附在正文之后；
+    - 图片元素：网络地址输出为 Markdown 图片，base64 内嵌图跳过（避免文件过大）；
+    - 空内容与临时占位语（如"正在思考..."）自动过滤。
+    """
+    parts = []        # 正文内容
+    expander_parts = []  # 折叠面板内容（标题, 内容）
+    for e in elements or []:
+        content = getattr(e, "content", None)
+        if not isinstance(content, str):
+            continue
+        content = content.strip()
+        if content in _EXPORT_PLACEHOLDERS:
+            continue
+        # 图片元素单独处理
+        if getattr(e, "type", None) == "image":
+            if content.startswith("http"):
+                parts.append(f"![图片]({content})")
+            continue
+        if getattr(e, "in_expander", False):
+            title = getattr(e, "title", None) or "附加信息"
+            expander_parts.append((title, content))
+        else:
+            parts.append(content)
+
+    text = "\n\n".join(parts)
+    for title, content in expander_parts:
+        text += f"\n\n<details>\n<summary>{title}</summary>\n\n{content}\n\n</details>"
+    return text.strip() or "（无文本内容）"
+
+
+def _export_single_conv_md(chat_box, name: str) -> str:
+    """
+    【阶段3新增】导出单个会话为 Markdown 文本
+    """
+    history = chat_box.other_history(name) or []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        f"# 对话记录：{name}",
+        "",
+        f"> 导出时间：{now}  ",
+        f"> 消息数量：{len(history)} 条  ",
+        "> 导出来源：Langchain-Chatchat WebUI（前端本地生成，不经过后端存储）",
+        "",
+        "---",
+        "",
+    ]
+    for msg in history:
+        role = msg.get("role", "user")
+        label = "👤 用户" if role == "user" else "🤖 AI"
+        content = _fmt_export_elements(msg.get("elements"))
+        lines += [f"## {label}", "", content, ""]
+    return "\n".join(lines)
+
+
+def build_chat_export_md(chat_box, export_all: bool = False) -> str:
+    """
+    【阶段3新增】聊天记录一键导出为 Markdown（仅前端实现，不新增后端存储）
+
+    读取 streamlit_chatbox 保存在浏览器会话中的对话数据并拼装为规范的
+    Markdown 文档；export_all 为 True 时导出全部会话，否则仅导出当前会话。
+    """
+    if not export_all:
+        return _export_single_conv_md(chat_box, chat_box.cur_chat_name)
+    names = chat_box.get_chat_names()
+    sections = [_export_single_conv_md(chat_box, n) for n in names]
+    header = f"# 对话记录汇总（共 {len(names)} 个会话）\n"
+    return header + "\n\n---\n\n".join(sections)
+
+
+def _safe_filename(name: str) -> str:
+    """
+    【阶段3新增】将会话名转换为安全的导出文件名（去除 Windows 非法字符）
+    """
+    return re.sub(r'[\\/:*?"<>|]', "_", name).strip() or "会话"
+
+
 # @st.cache_data
 def list_tools(_api: ApiRequest):
     return _api.list_tools() or {}
@@ -185,22 +321,39 @@ def dialogue_page(
             )
         )
         llm_model = cols[1].selectbox("选择LLM模型", llm_models, key="llm_model")
-        temperature = cols[2].slider("Temperature", 0.0, 1.0, key="temperature")
-        system_message = st.text_area("System Message:", key="system_message")
-        if st.button("OK"):
+        # 汉化：温度滑块与系统提示词输入框的界面标签
+        temperature = cols[2].slider("温度", 0.0, 1.0, key="temperature")
+        system_message = st.text_area("系统提示词：", key="system_message")
+        if st.button("确定"):  # 汉化：弹窗确认按钮
             rerun()
 
     @st.experimental_dialog("重命名会话")
     def rename_conversation():
-        name = st.text_input("会话名称")
-        if st.button("OK"):
+        # 预填当前会话名，方便在原名基础上修改
+        name = st.text_input("会话名称", value=chat_box.cur_chat_name)
+        if st.button("确定"):  # 汉化：弹窗确认按钮
+            # 【阶段3新增】重命名中文友好校验：空名称、与现有会话重名
+            if not name or not name.strip():
+                st.error("会话名称不能为空，请输入新的会话名称。")
+                return
+            name = name.strip()
+            if name == chat_box.cur_chat_name:
+                st.warning("新名称与当前会话名称相同，无需重命名。")
+                return
+            if name in chat_box.get_chat_names():
+                st.error(f"会话名称 “{name}” 已存在，请更换一个名称。")
+                return
+            # 名称合法：执行重命名（复用项目原有会话机制），同步切换标记并刷新
             chat_box.change_chat_name(name)
             restore_session()
             st.session_state["cur_conv_name"] = name
+            st.session_state["last_conv_name"] = name
+            st.toast(f"会话已重命名为 “{name}”", icon="✅")
             rerun()
 
     with st.sidebar:
-        tab1, tab2 = st.tabs(["工具设置", "会话设置"])
+        # 【阶段2新增】增加“Ollama 模型”标签页，承载 Ollama 可视化模型选择面板
+        tab1, tab2, tab3 = st.tabs(["工具设置", "会话设置", "Ollama 模型"])
 
         with tab1:
             use_agent = st.checkbox(
@@ -221,6 +374,7 @@ def dialogue_page(
                     key="selected_tools",
                 )
             else:
+                use_mcp = False
                 # selected_tool = sac.buttons(list(tools), format_func=lambda x: tools[x]["title"], label="选择工具",
              
                 selected_tools = []
@@ -261,7 +415,21 @@ def dialogue_page(
             # 用于图片对话、文生图的图片
             upload_image = None
             def on_upload_file_change():
-                if f := st.session_state.get("upload_image"):
+                f = st.session_state.get("upload_image")
+                # 【阶段3新增】图片上传前端中文校验：类型、大小、空文件
+                if f is not None:
+                    valid_files, errors = validate_uploaded_files(
+                        [f], allowed_exts=["bmp", "jpg", "jpeg", "png"]
+                    )
+                    if errors:
+                        # 校验不通过：中文提示并清空本次选择，不进入上传流程
+                        st.error("图片上传失败：" + "；".join(errors))
+                        st.session_state["cur_image"] = (None, None)
+                        try:
+                            del st.session_state["upload_image"]  # 清除不合规的文件选择
+                        except KeyError:
+                            pass
+                        return
                     name = ".".join(f.name.split(".")[:-1]) + ".png"
                     st.session_state["cur_image"] = (name, PILImage.open(f))
                 else:
@@ -307,6 +475,19 @@ def dialogue_page(
                 rename_conversation()
             if cols[2].button("删除", on_click=del_conv):
                 ...
+            # 【阶段3新增】批量删除会话：弹出多选弹窗，一次性删除多个会话
+            if st.button("批量删除", use_container_width=True):
+                batch_del_convs()
+
+        with tab3:
+            # 【阶段2新增】Ollama 可视化模型选择面板：
+            # 对接本地 Ollama 服务，下拉框自动读取本地模型列表，
+            # 切换模型复用原有模型配置逻辑（与“模型配置”弹窗共用 ctx["llm_model"]）
+            ollama_model_panel(
+                current_model=ctx.get("llm_model", ""),
+                save_session_fn=save_session,
+                rerun_fn=rerun,
+            )
 
     # Display chat messages from history on app rerun
     chat_box.output_messages()
@@ -340,9 +521,18 @@ def dialogue_page(
             chat_model_config[key][model] = llm_model_config[key]
     llm_model = ctx.get("llm_model")
     if llm_model is not None:
-        chat_model_config["llm_model"][llm_model] = llm_model_config["llm_model"].get(
-            llm_model, {}
-        )
+        # 【阶段2适配】后端 create_models_from_config 按“扁平结构”解析模型
+        # （configs[模型类型]["model"] 即模型名），此处以项目默认 llm_model / action_model
+        # 配置为模板并注入用户当前选中的模型（与“模型配置”弹窗及 Ollama 面板共用
+        # ctx["llm_model"]），保证面板切换模型后，后端实际生成与 Agent 调度均使用选中模型。
+        chat_model_config["llm_model"] = {
+            **llm_model_config["llm_model"],
+            "model": llm_model,
+        }
+        chat_model_config["action_model"] = {
+            **llm_model_config["action_model"],
+            "model": llm_model,
+        }
 
     # chat input
     with bottom():
@@ -358,10 +548,9 @@ def dialogue_page(
         #     mic_audio = audio_recorder("", icon_size="2x", key="mic_audio")
         prompt = cols[2].chat_input(chat_input_placeholder, key="prompt")
     if prompt:
+        # 【阶段2适配】chat_model_config["llm_model"] 已为扁平结构，直接读取 history_len
         history = get_messages_history(
-            chat_model_config["llm_model"]
-            .get(next(iter(chat_model_config["llm_model"])), {})
-            .get("history_len", 1)
+            chat_model_config["llm_model"].get("history_len", 1)
         )
 
         is_vision_chat = upload_image and not selected_tools
@@ -450,7 +639,11 @@ def dialogue_page(
                     if d.status == AgentStatus.error:
                         st.error(d.choices[0].delta.content)
                     elif d.status == AgentStatus.llm_start:
-                        chat_box.insert_msg("正在解读工具输出结果...")
+                        # 提示语纯装饰，流式中断后容器可能失配，失败时跳过以免中断回答
+                        try:
+                            chat_box.insert_msg("正在解读工具输出结果...")
+                        except IndexError:
+                            pass
                         text = d.choices[0].delta.content or ""
                     elif d.status == AgentStatus.llm_new_token:
                         text += d.choices[0].delta.content or ""
@@ -464,14 +657,18 @@ def dialogue_page(
                         )
                     # tool 的输出与 llm 输出重复了
                     elif d.status == AgentStatus.tool_start:
+                        # 汉化：工具调用展示卡片中的字段标签（仅展示用途，不参与业务逻辑）
                         formatted_data = {
-                            "Function": d.choices[0].delta.tool_calls[0].function.name,
-                            "function_input": d.choices[0].delta.tool_calls[0].function.arguments,
+                            "函数": d.choices[0].delta.tool_calls[0].function.name,
+                            "函数输入": d.choices[0].delta.tool_calls[0].function.arguments,
                         }
                         formatted_json = json.dumps(formatted_data, indent=2, ensure_ascii=False)
                         text = """\n```{}\n```\n""".format(formatted_json)
-                        chat_box.insert_msg( # TODO: insert text directly not shown
-                            Markdown(text, title="Function call", in_expander=True, expanded=True, state="running"))
+                        try:
+                            chat_box.insert_msg( # TODO: insert text directly not shown
+                                Markdown(text, title="工具调用", in_expander=True, expanded=True, state="running"))
+                        except IndexError:
+                            pass
                     elif d.status == AgentStatus.tool_end:
                         tool_output = d.choices[0].delta.tool_calls[0].tool_output
                         if d.message_type == MsgType.IMAGE:
@@ -483,7 +680,8 @@ def dialogue_page(
                                 chat_box.insert_msg(Image(url), pos=-2)
                             chat_box.update_msg(text, streaming=False, expanded=True, state="complete")
                         else:
-                            text += """\n```\nObservation:\n{}\n```\n""".format(tool_output)
+                            # 汉化：工具输出展示标签（仅展示用途，不参与业务逻辑）
+                            text += """\n```\n工具输出:\n{}\n```\n""".format(tool_output)
                             chat_box.update_msg(text, streaming=False, expanded=False, state="complete")
                     elif d.status == AgentStatus.agent_finish:
                         text = d.choices[0].delta.content or ""
@@ -498,15 +696,18 @@ def dialogue_page(
                                                                     api_base_url=api_address(is_public=True))
                                 context = "\n".join(source_documents)
 
-                            chat_box.insert_msg(
-                                Markdown(
-                                    context,
-                                    in_expander=True,
-                                    state="complete",
-                                    title="参考资料",
+                            try:
+                                chat_box.insert_msg(
+                                    Markdown(
+                                        context,
+                                        in_expander=True,
+                                        state="complete",
+                                        title="参考资料",
+                                    )
                                 )
-                            )
-                            chat_box.insert_msg("")
+                                chat_box.insert_msg("")
+                            except IndexError:
+                                pass
                         elif getattr(d, "tool_call", None) == "text2images":  # TODO：特定工具特别处理，需要更通用的处理方式
                             for img in d.tool_output.get("images", []):
                                 chat_box.insert_msg(Image(f"{api.base_url}/media/{img}"), pos=-2)
@@ -517,13 +718,13 @@ def dialogue_page(
                             )
                     chat_box.update_msg(text, streaming=False, metadata=metadata)
             except Exception as e:
-                st.error(e.body)
+                st.error(f"对话请求出错：{e}")
         else:
             try:
                 d =client.chat.completions.create(**params)
                 chat_box.update_msg(d.choices[0].message.content or "", streaming=False)
             except Exception as e:
-                st.error(e.body)
+                st.error(f"对话请求出错：{e}")
 
         # if os.path.exists("tmp/image.jpg"):
         #     with open("tmp/image.jpg", "rb") as image_file:
@@ -565,6 +766,13 @@ def dialogue_page(
 
     now = datetime.now()
     with tab2:
+        # 【阶段3新增】导出范围选择：仅前端读取会话数据，不涉及后端存储
+        export_scope = st.radio(
+            "导出范围：",
+            ["当前会话", "全部会话"],
+            horizontal=True,
+            key="export_scope",
+        )
         cols = st.columns(2)
         export_btn = cols[0]
         if cols[1].button(
@@ -574,10 +782,15 @@ def dialogue_page(
             chat_box.reset_history()
             rerun()
 
+    # 【阶段3改造】聊天记录一键导出 Markdown：
+    # 改用前端自定义导出函数 build_chat_export_md（仅读取浏览器会话中的对话数据），
+    # 替代原先 chat_box.export2md() 的 HTML 表格格式，输出更规范的 Markdown 文档
+    export_all = (export_scope == "全部会话")
+    scope_label = "全部会话" if export_all else _safe_filename(chat_box.cur_chat_name)
     export_btn.download_button(
         "导出记录",
-        "".join(chat_box.export2md()),
-        file_name=f"{now:%Y-%m-%d %H.%M}_对话记录.md",
+        build_chat_export_md(chat_box, export_all=export_all),
+        file_name=f"{scope_label}_{now:%Y-%m-%d %H.%M}_对话记录.md",
         mime="text/markdown",
         use_container_width=True,
     )

@@ -642,7 +642,7 @@ def add_new_connection_form(api: "ApiRequest"):
             
             # 可选：SSE 额外 header
             sse_headers = st.text_area(
-                "SSE Headers（可选，JSON）",
+                "SSE 请求头（可选，JSON）",  # 汉化：SSE 请求头表单标签
                 placeholder='例如：{"Authorization":"Bearer xxx"}',
                 help="以 JSON 形式填写可选的请求头",
                 key="conn_sse_headers",

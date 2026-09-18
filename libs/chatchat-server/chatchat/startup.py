@@ -87,10 +87,14 @@ def run_webui(
     flag_options = {
         "server_address": host,
         "server_port": port,
+        # 【粉色主题】以下主题参数与项目根目录 .streamlit/config.toml 保持一致；
+        # 因 bootstrap 以命令行参数形式传入，优先级高于 config.toml，
+        # 故此处必须同步修改，否则通过 `chatchat webui` 启动时粉色主题会被覆盖失效
         "theme_base": "light",
-        "theme_primaryColor": "#165dff",
-        "theme_secondaryBackgroundColor": "#f5f5f5",
-        "theme_textColor": "#000000",
+        "theme_primaryColor": "#EC7CA9",          # 主色调：柔和粉（按钮、滑块等）
+        "theme_secondaryBackgroundColor": "#FBEAF1",  # 次级背景：侧边栏浅粉
+        "theme_backgroundColor": "#FFFBFC",       # 页面主背景：近白微粉
+        "theme_textColor": "#4A2F3D",             # 正文文字：深梅紫，保证可读性
         "global_disableWatchdogWarning": None,
         "global_disableWidgetStateDuplicationWarning": None,
         "global_showWarningOnDirectExecution": None,

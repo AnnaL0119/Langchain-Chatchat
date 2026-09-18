@@ -73,12 +73,8 @@ def get_log_file(log_path: str, sub_dir: str):
 def get_config_dict(
         log_level: str, log_file_path: str, log_backup_count: int, log_max_bytes: int
 ) -> dict:
-    # for windows, the path should be a raw string.
-    log_file_path = (
-        log_file_path.encode("unicode-escape").decode()
-        if os.name == "nt"
-        else log_file_path
-    )
+    # 非 ASCII 路径经过 unicode-escape 会变成字面的 \uXXXX，导致日志文件无法创建
+    log_file_path = log_file_path
     log_level = log_level.upper()
     config_dict = {
         "version": 1,

@@ -13,7 +13,10 @@ from chatchat.server.knowledge_base.utils import LOADER_DICT
 from chatchat.server.utils import get_config_models, get_config_platforms, get_default_llm, api_address
 from chatchat.webui_pages.dialogue.dialogue import (save_session, restore_session, rerun,
                                                     get_messages_history, upload_temp_docs,
-                                                    add_conv, del_conv, clear_conv)
+                                                    add_conv, del_conv, clear_conv,
+                                                    batch_del_convs, build_chat_export_md,
+                                                    _safe_filename)
+from chatchat.webui_pages.upload_utils import validate_uploaded_files
 from chatchat.webui_pages.utils import *
 
 
@@ -67,18 +70,34 @@ def kb_chat(api: ApiRequest):
             )
         )
         llm_model = cols[1].selectbox("选择LLM模型", llm_models, key="llm_model")
-        temperature = cols[2].slider("Temperature", 0.0, 1.0, key="temperature")
-        system_message = st.text_area("System Message:", key="system_message")
-        if st.button("OK"):
+        # 汉化：温度滑块与系统提示词输入框的界面标签
+        temperature = cols[2].slider("温度", 0.0, 1.0, key="temperature")
+        system_message = st.text_area("系统提示词：", key="system_message")
+        if st.button("确定"):  # 汉化：弹窗确认按钮
             rerun()
 
     @st.experimental_dialog("重命名会话")
     def rename_conversation():
-        name = st.text_input("会话名称")
-        if st.button("OK"):
+        # 预填当前会话名，方便在原名基础上修改
+        name = st.text_input("会话名称", value=chat_box.cur_chat_name)
+        if st.button("确定"):  # 汉化：弹窗确认按钮
+            # 【阶段3新增】重命名中文友好校验：空名称、与现有会话重名
+            if not name or not name.strip():
+                st.error("会话名称不能为空，请输入新的会话名称。")
+                return
+            name = name.strip()
+            if name == chat_box.cur_chat_name:
+                st.warning("新名称与当前会话名称相同，无需重命名。")
+                return
+            if name in chat_box.get_chat_names():
+                st.error(f"会话名称 “{name}” 已存在，请更换一个名称。")
+                return
+            # 名称合法：执行重命名（复用项目原有会话机制），同步切换标记并刷新
             chat_box.change_chat_name(name)
             restore_session()
             st.session_state["cur_conv_name"] = name
+            st.session_state["last_conv_name"] = name
+            st.toast(f"会话已重命名为 “{name}”", icon="✅")
             rerun()
 
     # 配置参数
@@ -123,12 +142,30 @@ def kb_chat(api: ApiRequest):
                         key="selected_kb",
                     )
                 elif dialogue_mode == "文件对话":
+                    # 【阶段3新增】上传前的中文格式说明（复用原有上传接口，仅增加前端提示）
+                    st.caption(
+                        f"支持多选文件；单个文件不超过 200MB；"
+                        f"支持格式：{('、'.join('.' + e for ls in LOADER_DICT.values() for e in ls))}"
+                    )
                     files = st.file_uploader("上传知识文件：",
                                             [i for ls in LOADER_DICT.values() for i in ls],
                                             accept_multiple_files=True,
                                             )
                     if st.button("开始上传", disabled=len(files) == 0):
-                        st.session_state["file_chat_id"] = upload_temp_docs(files, api)
+                        # 【阶段3新增】上传前前端中文校验：空文件/大小超限/类型不支持
+                        valid_files, errors = validate_uploaded_files(files)
+                        if errors:
+                            st.error("文件上传失败，请先处理以下问题：\n\n"
+                                     + "\n".join(f"- {e}" for e in errors))
+                        else:
+                            knowledge_id = upload_temp_docs(valid_files, api)
+                            if knowledge_id:
+                                st.session_state["file_chat_id"] = knowledge_id
+                                st.success("文件上传成功，已可以开始对话。")
+                            else:
+                                # 上传失败中文提示（复用原有上传接口，接口异常时前端兜底提示）
+                                st.error("文件上传失败：无法连接后端服务或文件解析失败，"
+                                         "请确认 API 服务（默认端口 7861）已启动后重试。")
                 elif dialogue_mode == "搜索引擎问答":
                     search_engine_list = list(Settings.tool_settings.search_internet["search_engine_config"])
                     search_engine = st.selectbox(
@@ -161,6 +198,9 @@ def kb_chat(api: ApiRequest):
                 rename_conversation()
             if cols[2].button("删除", on_click=del_conv):
                 ...
+            # 【阶段3新增】批量删除会话：弹出多选弹窗，一次性删除多个会话
+            if st.button("批量删除", use_container_width=True):
+                batch_del_convs()
 
     # Display chat messages from history on app rerun
     chat_box.output_messages()
@@ -237,6 +277,13 @@ def kb_chat(api: ApiRequest):
 
     now = datetime.now()
     with tabs[1]:
+        # 【阶段3新增】导出范围选择：仅前端读取会话数据，不涉及后端存储
+        export_scope = st.radio(
+            "导出范围：",
+            ["当前会话", "全部会话"],
+            horizontal=True,
+            key="export_scope",
+        )
         cols = st.columns(2)
         export_btn = cols[0]
         if cols[1].button(
@@ -246,10 +293,15 @@ def kb_chat(api: ApiRequest):
             chat_box.reset_history()
             rerun()
 
+    # 【阶段3改造】聊天记录一键导出 Markdown：
+    # 复用 dialogue 页的前端导出函数 build_chat_export_md（仅读取浏览器会话中的对话数据），
+    # 替代原先 chat_box.export2md() 的 HTML 表格格式，输出更规范的 Markdown 文档
+    export_all = (export_scope == "全部会话")
+    scope_label = "全部会话" if export_all else _safe_filename(chat_box.cur_chat_name)
     export_btn.download_button(
         "导出记录",
-        "".join(chat_box.export2md()),
-        file_name=f"{now:%Y-%m-%d %H.%M}_对话记录.md",
+        build_chat_export_md(chat_box, export_all=export_all),
+        file_name=f"{scope_label}_{now:%Y-%m-%d %H.%M}_对话记录.md",
         mime="text/markdown",
         use_container_width=True,
     )

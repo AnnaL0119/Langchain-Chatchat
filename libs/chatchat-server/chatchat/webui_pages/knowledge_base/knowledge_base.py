@@ -17,6 +17,7 @@ from chatchat.server.knowledge_base.kb_service.base import (
 from chatchat.server.knowledge_base.utils import LOADER_DICT, get_file_path
 from chatchat.server.utils import get_config_models, get_default_embedding
 
+from chatchat.webui_pages.upload_utils import validate_uploaded_files, get_upload_failure_msg
 from chatchat.webui_pages.utils import *
 
 # SENTENCE_SIZE = 100
@@ -153,9 +154,15 @@ def knowledge_base_page(api: ApiRequest, is_lite: bool = None):
         kb = selected_kb
         st.session_state["selected_kb_info"] = kb_list[kb]["kb_info"]
         # 上传文件
+        # 【阶段3新增】上传前的中文格式说明（复用原有上传接口，仅增加前端提示）
+        allowed_exts = [i for ls in LOADER_DICT.values() for i in ls]
+        st.caption(
+            "支持多选文件；单个文件不超过 200MB；"
+            f"支持格式：{('、'.join('.' + e for e in allowed_exts))}"
+        )
         files = st.file_uploader(
             "上传知识文件：",
-            [i for ls in LOADER_DICT.values() for i in ls],
+            allowed_exts,
             accept_multiple_files=True,
         )
         kb_info = st.text_area(
@@ -192,18 +199,27 @@ def knowledge_base_page(api: ApiRequest, is_lite: bool = None):
             # use_container_width=True,
             disabled=len(files) == 0,
         ):
-            ret = api.upload_kb_docs(
-                files,
-                knowledge_base_name=kb,
-                override=True,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                zh_title_enhance=zh_title_enhance,
-            )
-            if msg := check_success_msg(ret):
-                st.toast(msg, icon="✔")
-            elif msg := check_error_msg(ret):
-                st.toast(msg, icon="✖")
+            # 【阶段3新增】上传前前端中文校验：空文件/大小超限/类型不支持
+            valid_files, upload_errors = validate_uploaded_files(files)
+            if upload_errors:
+                st.error("文件上传失败，请先处理以下问题：\n\n"
+                         + "\n".join(f"- {e}" for e in upload_errors))
+            else:
+                # 复用项目原有上传接口 upload_docs，仅增加前端校验与中文失败提示
+                ret = api.upload_kb_docs(
+                    valid_files,
+                    knowledge_base_name=kb,
+                    override=True,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    zh_title_enhance=zh_title_enhance,
+                )
+                if msg := check_success_msg(ret):
+                    st.toast(msg, icon="✔")
+                elif upload_failure := get_upload_failure_msg(ret, "知识文件上传"):
+                    st.error(upload_failure)
+                elif msg := check_error_msg(ret):
+                    st.toast(msg, icon="✖")
 
         st.divider()
 
@@ -387,7 +403,7 @@ def knowledge_base_page(api: ApiRequest, is_lite: bool = None):
 
             gb = GridOptionsBuilder.from_dataframe(df)
             gb.configure_columns(["id", "source", "type", "metadata"], hide=True)
-            gb.configure_column("seq", "No.", width=50)
+            gb.configure_column("seq", "序号", width=50)  # 汉化：表格序号列头
             gb.configure_column(
                 "page_content",
                 "内容",

@@ -1,0 +1,39 @@
+# ============================================================
+# Langchain-Chatchat Streamlit WebUI 主题配置文件
+# 作用范围：仅影响 WebUI 展示层外观，不涉及任何后端（RAG/向量库/FastAPI）逻辑
+# 生效条件：以项目根目录作为工作目录启动 streamlit 时自动加载
+# ============================================================
+
+[theme]
+# 基础模式：浅色基底，粉色元素更柔和
+base = "light"
+
+# 主色调：柔和粉（按钮、滑块、复选框、链接、选中高亮等交互元素）
+primaryColor = "#EC7CA9"
+
+# 页面主背景：近白微粉，长时间阅读不刺眼
+backgroundColor = "#FFFBFC"
+
+# 次级背景：侧边栏、输入框、Expander、代码块等区域的浅粉色
+secondaryBackgroundColor = "#FBEAF1"
+
+# 正文文字色：深梅紫色，与粉色背景对比度足够，保证可读性
+textColor = "#4A2F3D"
+
+# 字体：无衬线字体，中文渲染更清晰
+font = "sans serif"
+
+[server]
+# WebUI 默认监听端口（与 Settings.basic_settings.WEBUI_SERVER 保持一致）
+port = 8501
+
+# 单次上传文件大小上限（MB），知识库批量上传文件时需要较大的值
+maxUploadSize = 200
+
+[browser]
+# 关闭 Streamlit 用量统计上报
+gatherUsageStats = false
+
+[client]
+# 顶栏工具条设为极简模式，隐藏内置的 "Deploy"、"Get help" 等英文按钮
+toolbarMode = "minimal"
