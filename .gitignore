@@ -188,3 +188,11 @@ libs/chatchat-server/data/knowledge_base/info.db
 data/logs/
 data/temp/
 gui-test-screenshots/
+
+# 个人学习笔记，不公开
+本项目技术栈学习路线.md
+
+# 本地专属文档（含本机E盘路径）
+项目部署与开发启动文档.md
+项目改造总报告.md
+重启电脑后启动指南.md
